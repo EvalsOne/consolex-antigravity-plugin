@@ -2196,6 +2196,9 @@ def activate(data, env, skill_dir, http=http_json):
     marker['on_failure'] = body['on_failure'] if body.get('on_failure') in ('fix_rules', 'fix_failed') else 'report'
     marker['fix_rounds'] = fix_rounds(body) if marker['on_failure'] != 'report' else 0
     marker['recover_evidence'] = body.get('recover_evidence') is True
+    if client(env) == 'antigravity' and schedule_id:
+        # Each native Automation trigger reports one delivery verdict for owner review.
+        marker.update(on_failure='report', fix_rounds=0, recover_evidence=False)
     if not explicit:
         session_event(config, env, data, marker, 'start', http=http)
     save_marker(env, marker)
@@ -6311,7 +6314,7 @@ def _tool_failed(response):
 
 # Which desktop app runs a local schedule, by the runtime ConsoleX names for its computer (older servers name none:
 # only Claude Code reported schedules then).
-_SCHEDULER_APPS = {'claude_code': 'Claude desktop', 'codex': 'Codex app'}
+_SCHEDULER_APPS = {'claude_code': 'Claude desktop', 'codex': 'Codex app', 'antigravity': 'Antigravity'}
 
 
 def _where_it_runs(hosted, others):
@@ -6334,7 +6337,8 @@ def _how_to_stop(hosted, others):
     if others:
         apps = sorted({_SCHEDULER_APPS.get(other.get('runtime'), 'Claude desktop') for other in others})
         places = ' or '.join({'Claude desktop': "the Claude desktop app's Scheduled tasks",
-                              'Codex app': "the Codex app's Scheduled view"}[app] for app in apps)
+                              'Codex app': "the Codex app's Scheduled view",
+                              'Antigravity': "the Antigravity App's Automations view"}[app] for app in apps)
         how.append("on that computer, pause or delete it in %s, or ask the agent there to stop it; if that computer no "
                    "longer runs it, the task's page in ConsoleX can release it" % places)
     return '; '.join(how)
@@ -6434,7 +6438,10 @@ def _schedule_gate(env, config, http):
     Several schedules on this computer are fine. Not connected blocks (the runs could not be checked either);
     ConsoleX unreachable or too old to say only warns."""
     token = _token(config, env)
-    status, body = http('GET', _task_url(config, env, 'schedules'), token, timeout=QUICK_TIMEOUT) if token else (401, {})
+    url = _task_url(config, env, 'schedules')
+    if client(env) == 'antigravity':
+        url += '?runtime=antigravity'
+    status, body = http('GET', url, token, timeout=QUICK_TIMEOUT) if token else (401, {})
     if status == 401:
         return 'block', ('ConsoleX is not connected on this computer (%s), so it cannot say whether this task already '
                          'runs elsewhere, and scheduled runs would not be checked. Tell the user to run /consolex:login '

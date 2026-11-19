@@ -31,11 +31,18 @@ When the task has automatic checks enabled, an explicit delivery like this is su
 
 To deliver a local text file, use `- File: <path>` in place of the reply declaration. ConsoleX can request a bounded revision when the task's settings allow it.
 
+## Schedule a task
+
+Scheduling requires ConsoleX for Antigravity 0.2.0 and a compatible ConsoleX server. In the task’s **Run in a coding agent…** dialog, select Antigravity. Under **Run on a schedule**, choose a recurrence and time zone, then copy the command into a conversation in the task’s Antigravity project. Open **Automations**, review the paused entry and its project permissions, then enable it. Keep the App open and the computer awake. To replace the schedule from ConsoleX, pause it in the App first.
+
+Each trigger opens a new conversation for the saved ConsoleX task. The plugin checks its delivery once and displays the verdict and run link. Review that result before asking for revisions.
+
 | Command | Action |
 | --- | --- |
 | `/consolex-status` | Show your connection and tasks |
 | `/consolex-tasks [search]` | Find a task |
 | `/consolex-start <UUID> [-- request]` | Start a task in this conversation |
+| `/consolex-schedule <UUID> -- CRON_TZ=<zone> <cron>` | Prepare a paused native Automation |
 | `/consolex-add <UUID>` | Add a reusable `/cx-…` shortcut |
 | `/consolex-remove <UUID or shortcut>` | Remove a local shortcut |
 | `/consolex-check [off]` | Check the latest delivery or turn off automatic checks for this session |

@@ -2,7 +2,7 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "consolex",
   "displayName": "ConsoleX",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Run ConsoleX tasks in Antigravity and check deliveries against your saved acceptance standard.",
   "author": {
     "name": "ConsoleX"

@@ -13,6 +13,10 @@ from pathlib import Path
 import re
 import sys
 
+_automation_spec = importlib.util.spec_from_file_location('consolex_antigravity_automation',
+                                                         Path(__file__).with_name('automation.py'))
+automation = importlib.util.module_from_spec(_automation_spec)
+_automation_spec.loader.exec_module(automation)
 
 _shared = Path(__file__).with_name('runtime.py')
 if not _shared.is_file():  # Source checkout only; the builder includes its own copy.
@@ -80,7 +84,9 @@ def _context(output):
 
 
 def _injection(text):
-    return {'injectSteps': [{'ephemeralMessage': text}]} if text else {}
+    # Antigravity deprecated ephemeralMessage (it is not delivered to the model);
+    # systemMessage requires the nested object shape per hooks.md.
+    return {'injectSteps': [{'systemMessage': {'systemMessage': text}}]} if text else {}
 
 
 def tool_call(payload):
@@ -213,6 +219,10 @@ def _handle(payload, env, event, state, http):
     data = {'session_id': session, 'turn_id': state.get('turn', 'session'), 'cwd': cwd,
             'model': payload.get('modelName'), 'hook_event_name': event}
     if event == 'SessionStart':
+        try:
+            automation.reconcile(core, env, http)
+        except (OSError, ValueError):
+            pass  # Task setup and scheduled starts verify their own automation state.
         return translate(runtime.handle(data, env, 'antigravity', http=http), event, payload)
     rows = read_transcript(payload, env)
     user = next((row for row in reversed(rows) if row.get('type') == 'USER_INPUT'
@@ -233,6 +243,24 @@ def _handle(payload, env, event, state, http):
             raw = _user_request(raw)
             if runtime.COMMAND.match(raw) or runtime.TASK.match(raw):
                 prompt = raw  # A host can expand a selected Skill in the transcript.
+        command = runtime.COMMAND.match(prompt)
+        if command and command[1] == 'schedule':
+            try:
+                note = automation.prepare(core, env, data, prompt, http)
+            except (OSError, ValueError) as exc:
+                note = 'Could not prepare the Antigravity automation: %s.' % exc
+            return _injection('Relay this setup result to the user. Do not run the task or enable the automation. '
+                              + core.native_text(note, 'antigravity'))
+        if prompt.startswith(automation.PROMPT_PREFIX):
+            try:
+                output, error = automation.start(core, env, data, prompt, user['step_index'] == 0, http)
+            except (OSError, ValueError, KeyError, TypeError):
+                output, error = None, 'The Antigravity automation settings could not be verified.'
+            if error:
+                return {'terminationBehavior': 'terminate', 'injectSteps': [
+                    {'errorMessage': {'userMessage': 'ConsoleX automation did not start. ' + error}}]}
+            state['automation_turn'] = turn
+            return _injection(core.native_text(_context(output), 'antigravity'))
         output = runtime.handle({**data, 'hook_event_name': 'UserPromptSubmit',
                                  'prompt': prompt}, env, 'antigravity', http=http)
         return translate(output, event, payload)
@@ -244,6 +272,11 @@ def _handle(payload, env, event, state, http):
         return _problem(event, 'The current user turn was not observed by the ConsoleX prompt hook', state)
     if event == 'PreToolUse':
         name, args, _ = tool_call(payload)
+        if name == 'mcp__consolex__' + core.START_TASK_TOOL:
+            if state.get('automation_turn') == turn:
+                return {'decision': 'deny', 'reason': 'The native Automation already started its saved ConsoleX task.'}
+            if args.get('unattended') or args.get('schedule_id') is not None:
+                return {'decision': 'deny', 'reason': 'Scheduled starts require a verified Antigravity Automation event.'}
         # A question pauses this session; the next explicit user turn releases it.
         output = runtime.handle({**data, 'tool_name': name, 'tool_input': args}, env, 'antigravity', http=http)
         return translate(output, event, payload)
