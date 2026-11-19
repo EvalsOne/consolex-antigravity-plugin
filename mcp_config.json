@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "tools": {
+      "command": "python3",
+      "args": [
+        "${PLUGIN_ROOT}/scripts/consolex_mcp.py"
+      ],
+      "env": {
+        "CONSOLEX_RUNTIME": "antigravity"
+      },
+      "timeoutSeconds": 360,
+      "tools": {
+        "consolex_start_task": {
+          "eager": true
+        },
+        "consolex_checkpoint": {
+          "eager": true
+        },
+        "consolex_save": {
+          "eager": true
+        }
+      }
+    }
+  }
+}

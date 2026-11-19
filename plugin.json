@@ -1,0 +1,15 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "consolex",
+  "displayName": "ConsoleX",
+  "version": "0.1.1",
+  "description": "Run ConsoleX tasks in Antigravity and check deliveries against your saved acceptance standard.",
+  "author": {
+    "name": "ConsoleX"
+  },
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Connect this computer to ConsoleX",
+    "Show my ConsoleX tasks"
+  ]
+}

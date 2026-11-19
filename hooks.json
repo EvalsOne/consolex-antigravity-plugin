@@ -1,0 +1,49 @@
+{
+  "consolex": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "python3 ./scripts/antigravity.py SessionStart",
+        "timeout": 30
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "python3 ./scripts/antigravity.py PreInvocation",
+        "timeout": 200
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "python3 ./scripts/antigravity.py Stop",
+        "timeout": 200
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./scripts/antigravity.py PreToolUse",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./scripts/antigravity.py PostToolUse",
+            "timeout": 200
+          }
+        ]
+      }
+    ]
+  }
+}
