@@ -128,6 +128,24 @@ def skills_dir(env):
         '.claude' if client(env) == 'claude_code' else '.agents', 'skills')
 
 
+def links_skills(env):
+    """Whether a task's main skill is kept once and linked where another agent loads skills. Not on Windows, where a
+    link needs a privilege most accounts lack: there each agent keeps its own copy, as before."""
+    return os.name != 'nt' and str(env.get('CONSOLEX_SKILL_LINKS') or '').strip().lower() not in ('off', '0', 'false', 'no')
+
+
+def shared_skills_dir(env):
+    """Where a task's main skill is kept so every coding agent on this computer reads the same copy: ~/.agents/skills.
+    Codex and DeepSeek Harness load that folder themselves; Claude Code and Antigravity load their own, and get a link."""
+    if client(env) in ('codex', 'deepseek_harness') or not links_skills(env):
+        return skills_dir(env)
+    return env.get('CONSOLEX_SHARED_SKILLS_DIR') or os.path.join(os.path.expanduser('~'), '.agents', 'skills')
+
+
+def _same_folder(first, second):
+    return os.path.realpath(first) == os.path.realpath(second)
+
+
 def _write_private(path, data):
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
     tmp = path + '.tmp'
@@ -701,8 +719,6 @@ def _connection_lines(api_base, token, connection, http, many=False, is_default=
 def on_status(data, env, argument, http=http_json):
     """`/consolex:status`: whether this computer is connected (asked of ConsoleX, not only read from the file), as
     whom, whether it may use the tasks' tools and files, and which installed tasks cannot be checked from here."""
-    if _pending_saves(env):
-        poll_saves_once(env, http=http)
     default = default_api_base(env)
     # The default first, then every other saved connection: a computer can be signed in to several addresses.
     bases = [default] + [base for base in load_credentials(env)['servers'] if base != default]
@@ -1069,30 +1085,25 @@ def _refresh_state_path(env):
     return os.path.join(consolex_home(env), 'skills-refresh.json')
 
 
-def on_session_start(data, env, spawn=None, note=True):
-    """SessionStart: refresh the installed tasks and their Skills in the background, at most once an hour, and keep
-    waiting for saved sessions the owner has not saved as tasks yet. Returns a note for the agent when a task was
-    added here since the last session (a session saved with /consolex:save, then saved in ConsoleX).
+def on_session_start(data, env, spawn=None):
+    """SessionStart: refresh the installed tasks and their Skills in the background, at most once an hour.
 
     Never blocks the session: only the throttle check and detached processes run here."""
     write_launcher(env)
-    if _pending_saves(env) and not _save_poller_running(env):
-        SAVE_POLLER(env)
-    note = take_install_note(env, data) if note else None
     # Desktop schedules can exist without an installed task Skill.
     if client(env) in ('codex', 'claude_code') or _installed_skills(env):
         sync_schedules_if_changed(env)
     if not _installed_skills(env):
-        return note
+        return None
     state = _read_json(_refresh_state_path(env), {})
     state = state if isinstance(state, dict) else {}
     key = os.path.abspath(skills_dir(env))
     if time.time() - float(state.get(key) or 0) < SKILLS_REFRESH_SECONDS:
-        return note
+        return None
     state[key] = time.time()
     _write_private(_refresh_state_path(env), state)
     (spawn or _spawn_refresher)(env)
-    return note
+    return None
 
 
 def _spawn_refresher(env):
@@ -2301,24 +2312,77 @@ def find_method_skill(name, env, cwd):
 
 
 def _agent_skill_roots(agent, env, cwd):
-    """Where `agent` loads skills from on this computer: the project's, then the personal folder (its default)."""
+    """[(skills folder, its project or None)] where `agent` loads skills on this computer: the project's, then its
+    personal folder (its default). Codex and DeepSeek Harness share theirs; Antigravity's project folder is theirs too."""
+    home = os.path.expanduser('~')
+    if agent == 'antigravity':
+        return [(os.path.join(home, '.gemini', 'config', 'skills'), None)]
     folder = '.claude' if agent == 'claude_code' else '.agents'
-    roots = [os.path.join(root, folder, 'skills') for root in (env.get('CLAUDE_PROJECT_DIR'), cwd) if root]
-    roots.append(os.path.join(os.path.expanduser('~'), folder, 'skills'))
+    roots = [(os.path.join(root, folder, 'skills'), root) for root in (env.get('CLAUDE_PROJECT_DIR'), cwd)
+             if root and not _same_folder(root, home)]
+    roots.append((os.path.join(home, folder, 'skills'), None))
     return list(dict.fromkeys(roots))
 
 
 def skill_in_other_agent(name, env, cwd):
-    """(folder, agent) when the other kind of coding agent on this computer has the owner's skill `name`: Claude Code
-    keeps skills in .claude/skills, Codex and DeepSeek Harness in .agents/skills. None otherwise."""
-    other = 'codex' if client(env) == 'claude_code' else 'claude_code'
-    folder = _find_skill_in(name, _agent_skill_roots(other, env, cwd))
-    return (folder, RUNTIME_LABELS[other]) if folder else None
+    """(folder, agent, its project or None) when another kind of coding agent on this computer has the owner's skill
+    `name`: Claude Code keeps skills in .claude/skills, Codex and DeepSeek Harness in .agents/skills, Antigravity in
+    ~/.gemini/config/skills. The shared .agents/skills comes first. None otherwise."""
+    own = 'codex' if client(env) == 'deepseek_harness' else client(env)
+    for agent in ('codex', 'claude_code', 'antigravity'):
+        if agent == own:
+            continue
+        roots = _agent_skill_roots(agent, env, cwd)
+        folder = _find_skill_in(name, [root for root, _ in roots])
+        if folder:
+            return folder, agent, next((project for root, project in roots if root == os.path.dirname(folder)), None)
+    return None
+
+
+def _share_skill_plan(found, project, env):
+    """How this agent comes to load the skill folder `found` that another agent has, with one copy on the computer:
+    (command, kept, link, in_the_way). `kept` is where the skill's files are afterwards: .agents/skills, which Codex
+    and DeepSeek Harness load themselves; a skill that is elsewhere moves there and leaves a link behind, one that
+    someone already keeps as a link stays where it really is. `link` is the entry this agent loads, None when it
+    loads `kept` itself. `in_the_way` names what already has one of those names: then there is no command."""
+    base = os.path.basename(os.path.normpath(found))
+    if project:
+        shared = os.path.join(project, '.agents', 'skills')
+        own = os.path.join(project, '.claude' if client(env) == 'claude_code' else '.agents', 'skills')
+    else:
+        shared, own = shared_skills_dir(env), skills_dir(env)
+    steps, taken = [], []
+
+    def link(target, place):
+        # A link inside a project is relative, so it holds wherever the repository is checked out.
+        inside = project and _under(os.path.abspath(target), os.path.abspath(project))
+        source = os.path.relpath(target, os.path.dirname(place)) if inside else target
+        steps.extend(['mkdir -p %s' % shlex.quote(os.path.dirname(place)), 'ln -s %s %s' % (shlex.quote(source), shlex.quote(place))])
+
+    kept = found
+    if os.path.islink(found):
+        kept = os.path.realpath(found)
+    elif not _same_folder(os.path.dirname(found), shared):
+        kept = os.path.join(shared, base)
+        taken.append(kept)
+        steps.extend(['mkdir -p %s' % shlex.quote(shared), 'mv %s %s' % (shlex.quote(found), shlex.quote(kept))])
+        link(kept, found)
+    place = os.path.join(own, base)
+    if os.path.abspath(place) == os.path.abspath(kept):
+        place = None
+    else:
+        taken.append(place)
+        link(kept, place)
+    in_the_way = next((path for path in taken if os.path.lexists(path)), None)
+    # The command checks again when it runs: `mv` and `ln` would otherwise put the skill inside a folder of that name.
+    guards = ['test ! -e %s' % shlex.quote(path) for path in taken]
+    return (None if in_the_way else ' && '.join(guards + steps)), kept, place, in_the_way
 
 
 def copy_skill_note(method, env, cwd, zh):
-    """What the agent tells, or asks, the owner when this agent lacks a task's skill: copy it from the other agent on
-    this computer (only once the owner agrees), or install it. None when the skill is here."""
+    """What the agent tells, or asks, the owner when this agent lacks a task's skill and another agent on this computer
+    has it: share that one copy through a link (only once the owner agrees), or install it. None when the skill is here.
+    Where links are off (Windows) the offer is a copy, as it was before."""
     if find_method_skill(method['skill'], env, cwd):
         return None
     agent = RUNTIME_LABELS.get(client(env), client(env))
@@ -2328,23 +2392,52 @@ def copy_skill_note(method, env, cwd, zh):
                  if zh else 'This task\'s method is the skill `%s`, which %s on this computer does not have yet: until it '
                  'is installed (in %s), starting the task stops. Tell the user.') % (method['skill'], agent,
                                                                                      literal(skills_dir(env), env)))
-    found_folder, _ = found
-    other = named_agent('codex' if client(env) == 'claude_code' else 'claude_code', env)
-    found_target = os.path.join(skills_dir(env), os.path.basename(os.path.normpath(found_folder)))
+    found_folder, other_kind, project = found
+    other = named_agent(other_kind, env)
+    folder = literal(found_folder, env)
+    if not links_skills(env):
+        found_target = os.path.join(skills_dir(env), os.path.basename(os.path.normpath(found_folder)))
+        # Shell-quoted: a folder name is the owner's (or anyone's) text, never part of a command. Kept literal: the text
+        # is reworded for Codex and DSH afterwards, and a path or command must come through unchanged.
+        command = literal('cp -R %s %s' % (shlex.quote(found_folder), shlex.quote(found_target)), env)
+        target = literal(found_target, env)
+        if zh:
+            return ('这个任务的做法在 skill `%s` 里。这台电脑上的 %s 没有它，但 %s 有：%s。问用户一次（用提问工具，选项：复制过来 / 先不复制），'
+                    '要不要复制到 %s。用户同意才复制整个文件夹，用这条命令，原样执行，不要改写：`%s`；目标已经存在就不要复制，告诉用户。'
+                    '复制好后告诉用户可以开始任务了；用户不同意就告诉他，在 skill 装好之前开始这个任务会停下。') % (
+                method['skill'], agent, other, folder, target, command)
+        return ('This task\'s method is the skill `%s`. %s on this computer does not have it, but %s does: %s. Ask the user '
+                'once (with your question tool; options: copy it here / not now) whether to copy it to %s. Copy the folder only '
+                'if they agree, with exactly this command: `%s` (if the target already exists, do not copy: tell the user). Then '
+                'tell them they can start the task; if they decline, tell them starting the task stops until the skill is '
+                'here.') % (method['skill'], agent, other, folder, target, command)
+    command, kept, link, in_the_way = _share_skill_plan(found_folder, project, env)
+    if in_the_way:
+        return (('这个任务的做法在 skill `%s` 里。这台电脑上的 %s 没有它，但 %s 有：%s。两边本来可以共用这一份，但 %s 已经存在，'
+                 'ConsoleX 不会覆盖它。不要移动或链接任何东西；告诉用户这两个位置，由他决定留哪一个，在此之前开始这个任务会停下。')
+                if zh else
+                ('This task\'s method is the skill `%s`. %s on this computer does not have it, but %s does: %s. Both could use '
+                 'that one copy, but %s already exists and ConsoleX does not replace it. Do not move or link anything: tell the '
+                 'user both places and let them decide which to keep; until then starting the task stops.')) % (
+            method['skill'], agent, other, folder, literal(in_the_way, env))
     # Shell-quoted: a folder name is the owner's (or anyone's) text, never part of a command. Kept literal: the text
     # is reworded for Codex and DSH afterwards, and a path or command must come through unchanged.
-    command = literal('cp -R %s %s' % (shlex.quote(found_folder), shlex.quote(found_target)), env)
-    folder, target = literal(found_folder, env), literal(found_target, env)
+    command, moved = literal(command, env), os.path.abspath(kept) != os.path.abspath(found_folder) and not os.path.islink(found_folder)
+    kept, place = literal(kept, env), literal(link or kept, env)
     if zh:
-        return ('这个任务的做法在 skill `%s` 里。这台电脑上的 %s 没有它，但 %s 有：%s。问用户一次（用提问工具，选项：复制过来 / 先不复制），'
-                '要不要复制到 %s。用户同意才复制整个文件夹，用这条命令，原样执行，不要改写：`%s`；目标已经存在就不要复制，告诉用户。'
-                '复制好后告诉用户可以开始任务了；用户不同意就告诉他，在 skill 装好之前开始这个任务会停下。') % (
-            method['skill'], agent, other, folder, target, command)
-    return ('This task\'s method is the skill `%s`. %s on this computer does not have it, but %s does: %s. Ask the user '
-            'once (with your question tool; options: copy it here / not now) whether to copy it to %s. Copy the folder only '
-            'if they agree, with exactly this command: `%s` (if the target already exists, do not copy: tell the user). Then '
-            'tell them they can start the task; if they decline, tell them starting the task stops until the skill is '
-            'here.') % (method['skill'], agent, other, folder, target, command)
+        what = ('把它移到 %s（这台电脑上各个编程 agent 共用的位置），在原处留一个链接，%s 照常能用' % (kept, other) if moved
+                else '在 %s 建一个指向它的链接' % place)
+        return ('这个任务的做法在 skill `%s` 里。这台电脑上的 %s 没有它，但 %s 有：%s。两边可以共用这一份，不用复制。问用户一次'
+                '（用提问工具，选项：共用这一份 / 先不用），要不要%s。用户同意才执行，用这条命令，原样执行，不要改写：`%s`；'
+                '命令失败就不要再试别的办法，把输出告诉用户。做好后告诉用户可以开始任务了；用户不同意就告诉他，在 skill 装好之前'
+                '开始这个任务会停下。') % (method['skill'], agent, other, folder, what, command)
+    what = ('move it to %s (the folder every coding agent on this computer can share) and leave a link in its place, so %s '
+            'keeps using it' % (kept, other) if moved else 'link it at %s' % place)
+    return ('This task\'s method is the skill `%s`. %s on this computer does not have it, but %s does: %s. Both can use that '
+            'one copy, with nothing copied. Ask the user once (with your question tool; options: share this copy / not now) '
+            'whether to %s. Run it only if they agree, with exactly this command: `%s` (if it fails, do not try another way: '
+            'tell the user what it printed). Then tell them they can start the task; if they decline, tell them starting the '
+            'task stops until the skill is here.') % (method['skill'], agent, other, folder, what, command)
 
 
 def _find_skill_in(name, roots):
@@ -3086,6 +3179,9 @@ def session_event(config, env, data, marker, event, http=http_json):
     if event in SESSION_STATES:
         marker['state'] = SESSION_STATES[event]
     payload = {'session_id': data.get('session_id'), 'event': event, 'runtime': client(env)}
+    control = marker.get('run_control') or {}
+    if client(env) == 'codex' and event == 'end' and control.get('run_id'):
+        payload['expected_run_id'] = control['run_id']
     if marker.get('schedule_id'):
         payload['schedule_id'] = marker['schedule_id']  # a Claude desktop scheduled run: which schedule started it
     if event in ('seen', 'end'):
@@ -3097,7 +3193,25 @@ def session_event(config, env, data, marker, event, http=http_json):
             pass
     try:
         status, body = http('POST', _task_url(config, env, 'sessions'), token, payload, timeout=SESSION_TIMEOUT)
-        return status == 200 and body.get('succ') is True
+        if status != 200 or body.get('succ') is not True:
+            return False
+        run_id = body.get('run_id')
+        turn_id = data.get('turn_id')
+        if client(env) == 'codex' and event in ('start', 'seen') and type(run_id) is int and turn_id:
+            previous = marker.get('run_control')
+            marker['run_control'] = {'run_id': run_id, 'turn_id': turn_id}
+            if previous != marker['run_control'] and http is http_json:
+                socket_path = env.get('CONSOLEX_CODEX_CONTROL_SOCKET') or os.path.join(
+                    env.get('CODEX_HOME') or os.path.expanduser('~/.codex'), 'app-server-control', 'app-server-control.sock')
+                if os.path.exists(socket_path):
+                    try:
+                        subprocess.Popen([sys.executable, str(Path(__file__).with_name('runtime.py')),
+                                          '--watch-codex-turn', data['session_id'], str(run_id), turn_id, socket_path],
+                                         env=env, start_new_session=True, stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except OSError:
+                        pass  # This host can still stop at a hook boundary.
+        return True
     except Exception:
         return False
 
@@ -3128,7 +3242,10 @@ def heartbeat(data, env, http=http_json):
     if not marker:
         return
     working = marker.get('state', 'working') == 'working'
-    if working and time.time() - float(marker.get('beat_at') or 0) < HEARTBEAT_SECONDS:
+    control = marker.get('run_control') or {}
+    new_codex_turn = (client(env) == 'codex' and control.get('turn_id')
+                      and data.get('turn_id') and data['turn_id'] != control['turn_id'])
+    if working and not new_codex_turn and time.time() - float(marker.get('beat_at') or 0) < HEARTBEAT_SECONDS:
         return
     session_event(config, env, data, marker, 'seen', http=http)
     save_marker(env, marker)
@@ -3525,6 +3642,10 @@ def submission_payload(config, env, marker, data, delivery, output_text, agent_n
     receipt = (marker.get('revision') or {}).get('profile_receipt')
     if receipt:
         payload['profile_receipt'] = receipt
+    control = marker.get('run_control') or {}
+    if (client(env) == 'codex' and trigger == 'stop' and data.get('recovery_base_attempt') is None
+            and data.get('turn_id') == control.get('turn_id') and control.get('run_id')):
+        payload['active_run_id'] = control['run_id']
     if marker.get('execution_id'):
         payload['execution_id'] = marker['execution_id']
     if data.get('recovery_base_attempt') is not None:
@@ -4182,8 +4303,9 @@ def _under(path, root):
 
 def skill_scope(skill_dir, env, cwd=None):
     """Where a Skill lives: personal, project, plugin (comes with a plugin and is replaced when it updates) or other."""
+    personal = [skills_dir(env), shared_skills_dir(env)]  # the shared folder holds the copy this agent's link points at
     for path in (os.path.abspath(skill_dir), os.path.realpath(skill_dir)):
-        if _under(path, os.path.abspath(skills_dir(env))) or _under(path, os.path.realpath(skills_dir(env))):
+        if any(_under(path, os.path.abspath(root)) or _under(path, os.path.realpath(root)) for root in personal):
             return 'personal'
         if (os.sep + 'plugins' + os.sep) in path or _under(path, os.path.realpath(plugin_root())):
             return 'plugin'
@@ -4274,6 +4396,38 @@ def client_command(env):
                                             _sh(os.path.join(scripts_dir(), entry)))
 
 
+def _skill_link_command(env, name):
+    """The command that lets this agent load the skill folder `name` kept in the shared folder."""
+    shared, own = shared_skills_dir(env), skills_dir(env)
+    return 'mkdir -p %s && ln -s %s %s' % (shlex.quote(own), shlex.quote(os.path.join(shared, name)),
+                                           shlex.quote(os.path.join(own, name)))
+
+
+def _new_skill_link(env):
+    """What a save note adds about a new main skill when this agent does not load the shared folder itself."""
+    shared, own = shared_skills_dir(env), skills_dir(env)
+    if _same_folder(shared, own):
+        return ''
+    return (' That folder holds the one copy every coding agent on this computer can use; Claude Code loads skills from '
+            '%s, so link the new skill there with exactly this command, NAME being its folder\'s name: `%s` (if %s already '
+            'has that name, choose another name for the skill). Give the folder in %s as skill_path.') % (
+        literal(own, env), literal(_skill_link_command(env, 'NAME'), env), literal(own, env), literal(shared, env))
+
+
+def _unlinked_skill_problem(folder, env, cwd):
+    """A main skill kept in the shared folder that this agent cannot load yet: it needs its link before the save."""
+    shared, own = shared_skills_dir(env), skills_dir(env)
+    if _same_folder(shared, own) or not _under(os.path.realpath(folder), os.path.realpath(shared)):
+        return None
+    base = os.path.basename(os.path.normpath(folder))
+    here = find_method_skill(skill_frontmatter(folder)[0] or base, env, cwd or os.getcwd())
+    if here and _same_folder(here, folder):
+        return None
+    return ('Claude Code loads skills from %s, not from %s, so it could not start this task yet. Link the skill there with '
+            'exactly this command: `%s` (if it fails, tell the user what it printed), then call %s again.') % (
+        literal(own, env), literal(shared, env), literal(_skill_link_command(env, base), env), SAVE_TOOL)
+
+
 def save_steps(env, save_id, skills, name, results=()):
     """What the agent does after /consolex:save, before anything is sent."""
     listed = '\n'.join('   - %s (%s%s): %s' % (item['name'], item['scope'], ', installed by ConsoleX for a task' if item.get('managed') else '',
@@ -4289,7 +4443,7 @@ def save_steps(env, save_id, skills, name, results=()):
         'installed for a task cannot be the main skill; never edit those. If no loaded skill fits (only general-purpose '
         'ones, or none), create a new skill folder in %(personal)s with a SKILL.md: front matter with name and '
         'description, then how to do this work, naming the general-purpose skills it uses. Its name must not start with '
-        'cx-.\n'
+        'cx-.%(link)s\n'
         '2. Compare what the user asked for in this session with the main skill, and list the requirements the user '
         'stated that the skill does not have yet. Leave out rules about waiting for the user\'s confirmation, publishing '
         'or sending, and what to do when a check fails: ConsoleX keeps those as run rules. If the list is not empty, ask '
@@ -4316,7 +4470,8 @@ def save_steps(env, save_id, skills, name, results=()):
         'If that command cannot run either, or says there is no such save request, tell the user to restart this session '
         'so it gets the tools of the installed ConsoleX version (quit and reopen the app, or exit and resume the session '
         'in a terminal), then run /consolex:save again.') % {
-        'id': save_id, 'listed': listed, 'personal': skills_dir(env), 'tool': SAVE_TOOL,
+        'id': save_id, 'listed': listed, 'personal': literal(shared_skills_dir(env), env), 'link': _new_skill_link(env),
+        'tool': SAVE_TOOL,
         'command': literal(client_command(env), env),
         'results': '\n'.join('   - %s: %s characters%s; %s' % (item['id'], len(item['text']),
                              ', declared delivery' if item['declared'] else '', item['text'][:180]) for item in results),
@@ -4399,10 +4554,10 @@ def _main_skill_problem(folder, env, cwd):
         return 'A main skill\'s name must not start with cx- (ConsoleX uses that for task Skills). Rename it, then call %s again.' % SAVE_TOOL
     if os.path.isfile(os.path.join(folder, '.consolex-skill.json')):
         return ('ConsoleX installed that skill for a task and replaces it when the task updates. Create your own skill in %s '
-                'that names it, then call %s again.') % (skills_dir(env), SAVE_TOOL)
+                'that names it, then call %s again.') % (literal(shared_skills_dir(env), env), SAVE_TOOL)
     if skill_scope(folder, env, cwd) == 'plugin':
         return ('That skill comes with a plugin and is replaced when the plugin updates. Create your own skill in %s that '
-                'names it, then call %s again.') % (skills_dir(env), SAVE_TOOL)
+                'names it, then call %s again.') % (literal(shared_skills_dir(env), env), SAVE_TOOL)
     return None
 
 
@@ -4488,7 +4643,7 @@ def save_session(env, save_id, skill_path, rules='', name='', http=http_json, re
     folder = os.path.abspath(os.path.expanduser(str(skill_path or '').strip())) if str(skill_path or '').strip() else ''
     if not folder or not os.path.isdir(folder):
         return 'Give skill_path: the absolute path of the main skill\'s folder.', True
-    problem = _main_skill_problem(folder, env, request.get('cwd'))
+    problem = _main_skill_problem(folder, env, request.get('cwd')) or _unlinked_skill_problem(folder, env, request.get('cwd'))
     if problem:
         return problem, True
     skill, problem = read_method_skill(folder, env, request.get('cwd'))
@@ -4536,8 +4691,6 @@ def save_session(env, save_id, skill_path, rules='', name='', http=http_json, re
         os.remove(path)
     except OSError:
         pass
-    draft_id = str((body.get('draft') or {}).get('id') or '')
-    waiting = bool(_UUID.fullmatch(draft_id)) and remember_pending_save(env, draft_id, api_base)
     link = body.get('review_url') or ((connection.get('app_base') or env.get('CONSOLEX_APP_BASE') or '').rstrip('/')
                                       + (body.get('review_path') or ''))
     opened = bool(link and _open_browser(link, env))
@@ -4553,171 +4706,15 @@ def save_session(env, save_id, skill_path, rules='', name='', http=http_json, re
         '%s and the main skill "%s" (%s file(s), %s sent as text), with keys masked. The task\'s method stays in that '
         'skill; ConsoleX keeps its delivery goal, run rules and checks. Review it in ConsoleX: %s . When the user saves '
         'it there, they can choose a checklist or open final acceptance. Only the task is saved by default. They can '
-        'preview and explicitly submit the selected result as the first run for checking. %s%s%s') % (
+        'preview and explicitly submit the selected result as the first run for checking. %s Saving it there adds '
+        'nothing to this computer: afterwards they start the task here with /consolex:start and words from its name, '
+        'or run /consolex:add to get its /cx-… command.%s') % (
         len(request.get('user_messages') or []), len(request.get('final_reply') or ''),
         ', shortened' if request.get('reply_clipped') else '', sent_tools, skill['name'], len(skill['manifest']),
         len(skill['files']), link,
         'Opened in the default external browser.' if opened else 'Open this review link in your external browser (copy it if necessary).',
-        (' After they save it, this computer normally adds it within 30 seconds. Return here and send a message or '
-         'run /consolex:status to see confirmation. The one-day wait is the review deadline, not an installation delay.') if waiting else '',
         (' AI organizing was not available (%s), so the draft starts from the latest request.' % organize_error)
         if organize_error else '')), False
-
-
-# ---------------------------------------------------------------- adding a saved task
-
-SAVE_POLL_FIRST = 10  # seconds before the first check of a sent draft; each wait is longer, up to SAVE_POLL_MAX
-SAVE_POLL_MAX = 30
-SAVE_WAIT_SECONDS = 24 * 3600  # a draft lives a day in ConsoleX
-MAX_PENDING_SAVES = 20
-
-
-def _pending_saves_path(env):
-    return os.path.join(consolex_home(env), 'pending-saves.json')
-
-
-def _install_notes_path(env):
-    return os.path.join(consolex_home(env), 'added-tasks.json')
-
-
-def _save_poller_path(env):
-    return os.path.join(consolex_home(env), 'pending-saves.poller.json')
-
-
-def _pending_saves(env):
-    """{draft id: entry} of sessions sent with /consolex:save whose draft the owner has not saved yet, not expired."""
-    saves = _read_json(_pending_saves_path(env), {})
-    now = time.time()
-    return {key: value for key, value in (saves.items() if isinstance(saves, dict) else [])
-            if isinstance(value, dict) and now - float(value.get('sent_at') or 0) < SAVE_WAIT_SECONDS}
-
-
-def remember_pending_save(env, draft_id, api_base, spawn=None):
-    """Wait in the background for the owner to save this draft in ConsoleX, then add the task here. True when the
-    wait started (or was already running)."""
-    saves = _pending_saves(env)
-    saves[draft_id] = {'api_base': api_base, 'client': client(env), 'skills_dir': skills_dir(env), 'sent_at': time.time()}
-    saves = dict(sorted(saves.items(), key=lambda item: item[1]['sent_at'])[-MAX_PENDING_SAVES:])
-    _write_private(_pending_saves_path(env), saves)
-    return bool(_save_poller_running(env) or (spawn or SAVE_POLLER)(env))
-
-
-def _save_poller_running(env):
-    state = _read_json(_save_poller_path(env), {})
-    return isinstance(state, dict) and time.time() - float(state.get('at') or 0) < SAVE_POLL_MAX * 2
-
-
-def _entry_env(env, entry):
-    """The environment a pending save is added in: the runtime and skills folder it was sent from."""
-    extra = {'CONSOLEX_RUNTIME': entry.get('client') or client(env)}
-    if entry.get('skills_dir'):
-        extra['CONSOLEX_SKILLS_DIR'] = entry['skills_dir']
-    return {**env, **extra}
-
-
-def install_saved_task(env, api_base, token, task_uuid, http=http_json):
-    """Add a task to this runtime as its /cx-… Skill, as /consolex:add does. (folder, task name) or None."""
-    status, bundle = http('GET', api_base + '/api/operator/external/tasks/%s/skill' % task_uuid, token, timeout=QUICK_TIMEOUT)
-    if status != 200 or not bundle.get('succ'):
-        return None
-    folder, target = install_skill(env, bundle)
-    outcome = install_task_skills(env, api_base, token, task_uuid, bundle.get('skills') or [], http=http)
-    config = json.loads(bundle['files']['consolex.json'])
-    names = outcome['installed'] + outcome['updated'] + outcome['current'] + outcome['kept']
-    if names:
-        _list_task_skills(target, names, _zh(config))
-    return folder, config.get('task_name') or ''
-
-
-def poll_saves_once(env, http=http_json):
-    """One check of every pending save. A saved one is added here and noted for the next session; an expired or
-    deleted one is dropped. Returns how many still wait."""
-    done = set()
-    for draft_id, entry in _pending_saves(env).items():
-        here = _entry_env(env, entry)
-        api_base = entry.get('api_base') or default_api_base(here)
-        token, _ = connection_for(here, api_base)
-        if not token:
-            done.add(draft_id)  # Signed out: nothing to add it with.
-            continue
-        try:
-            status, body = http('GET', api_base + '/api/operator/external/drafts/%s/status' % draft_id, token,
-                                timeout=QUICK_TIMEOUT)
-        except Exception:
-            continue
-        if status in (401, 404) or (status == 200 and body.get('status') in ('expired', 'deleted')):
-            done.add(draft_id)
-        elif status == 200 and body.get('status') == 'saved' and body.get('task_uuid'):
-            try:
-                added = install_saved_task(here, api_base, token, body['task_uuid'], http=http)
-            except Exception:
-                added = None
-            if added:
-                done.add(draft_id)
-                notes = _read_json(_install_notes_path(env), [])
-                notes = [item for item in notes if isinstance(item, dict)] if isinstance(notes, list) else []
-                config = load_config(os.path.join(skills_dir(here), added[0]))
-                notes.append({'skill': added[0], 'name': added[1], 'client': here['CONSOLEX_RUNTIME'],
-                              'language': config.get('language'), 'at': time.time()})
-                _write_private(_install_notes_path(env), notes[-MAX_PENDING_SAVES:])
-    # Read again: a save sent while this check ran stays.
-    remaining = {key: value for key, value in _pending_saves(env).items() if key not in done}
-    _write_private(_pending_saves_path(env), remaining)
-    return len(remaining)
-
-
-def poll_saves_until_done(env, sleep=time.sleep, http=http_json):
-    """Background process started after /consolex:save: checks each sent draft, less and less often, until the owner
-    saved it (then adds the task here) or it expired."""
-    wait = SAVE_POLL_FIRST
-    while True:
-        _write_private(_save_poller_path(env), {'pid': os.getpid(), 'at': time.time()})
-        sleep(wait)
-        _write_private(_save_poller_path(env), {'pid': os.getpid(), 'at': time.time()})
-        if not poll_saves_once(env, http=http):
-            break
-        wait = min(SAVE_POLL_MAX, int(wait * 1.5))
-    try:
-        os.remove(_save_poller_path(env))
-    except OSError:
-        pass
-
-
-def _spawn_save_poller(env):
-    try:
-        subprocess.Popen([sys.executable, os.path.abspath(__file__), 'saves'], stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-                         env={**os.environ, **{key: value for key, value in env.items() if key.startswith('CONSOLEX_')}})
-        return True
-    except OSError:
-        return False
-
-
-SAVE_POLLER = _spawn_save_poller  # tests replace the detached poller
-
-
-def take_install_note(env, data):
-    """A note for the agent about tasks added in this runtime since its last session (then forgotten), or None."""
-    notes = _read_json(_install_notes_path(env), [])
-    if not isinstance(notes, list) or not notes:
-        return None
-    mine = [item for item in notes if isinstance(item, dict) and item.get('client', CLIENT) == client(env)]
-    if not mine:
-        return None
-    _write_private(_install_notes_path(env), [item for item in notes if item not in mine])
-    lines = ', '.join('"%s" as /%s' % (item.get('name') or item.get('skill'), item.get('skill')) for item in mine)
-    unnamed = [item['skill'] for item in mine if re.match(r'^cx-(?:consolex|task)(?:-|$)', item.get('skill') or '')]
-    text = ('ConsoleX: after the user saved them in ConsoleX, these tasks were added here: %s. At the end of your first '
-            'reply, tell the user in one line that they can start each with its command or schedule it.') % lines
-    if unnamed:
-        text += (' A Skill name holds only a-z, 0-9 and hyphens, so %s does not say what its task is: offer to give it a '
-                 'short English name (the ConsoleX tool %s renames it).') % (', '.join('/' + item for item in unnamed),
-                                                                            RENAME_SKILL_TOOL)
-    data = dict(data or {})
-    data.setdefault('hook_event_name', 'SessionStart')
-    output = _context(data, text)
-    output['systemMessage'] = 'ConsoleX: tasks saved and added here. Start with: ' + lines
-    return output
 
 
 # ---------------------------------------------------------------- isolated runs
@@ -6479,18 +6476,42 @@ MAX_START_LOOKUPS = 10
 _TASK_LINK = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', re.IGNORECASE)
 
 
+def _without_task_name(text, name):
+    """`text` without the task's own name at its start, or None when it does not start with it.
+
+    ConsoleX's start commands are `<UUID> <task name>`: the UUID picks the task (names can repeat) and the name is
+    there so the agent's session list shows which task ran, since agents title a session from its first message.
+    An agent may also hand the name over as the request (`<UUID> -- <task name>`)."""
+    name, text = ' '.join(str(name or '').split()), ' '.join(text.split())
+    if not name:
+        return None
+    if text.startswith('-- '):
+        return '' if text[3:].casefold() == name.casefold() else None
+    if text[:len(name)].casefold() != name.casefold() or text[len(name):len(name) + 1] not in ('', ' '):
+        return None
+    return text[len(name):].strip()
+
+
 def _find_task_to_start(env, api_base, token, argument, http):
     """(tasks, request, status, body) for `/consolex:start`'s argument.
 
-    `<task> -- <request>` splits at the dashes, and a ConsoleX link ends the task part. Otherwise the longest run of
+    `<task> -- <request>` splits at the dashes, and a ConsoleX link ends the task part; the task's own name right
+    after the link is a label (see `_without_task_name`), not a request. Otherwise the longest run of
     leading words that still finds a task names it and the rest is this time's request
     (`/consolex:start weekly note focus on churn`): every word must be in the name, so a longer run only narrows."""
     head, dashes, tail = argument.partition(' -- ')
     words, extra = head.split(), [tail.strip()] if tail.strip() else []
     link = next((index for index, word in enumerate(words) if _TASK_LINK.search(word)), None)
+    after_link = None
     if link is not None:
+        after_link = ' '.join(words[link + 1:]) + dashes + tail
         words, extra = words[:link + 1], words[link + 1:] + extra
     status, body = _list_tasks(env, api_base, token, ' '.join(words), http)
+    if after_link is not None and status == 200 and len(body.get('tasks') or []) == 1:
+        rest = _without_task_name(after_link, body['tasks'][0].get('name'))
+        if rest is not None:
+            head, _, tail = (' ' + rest).partition(' -- ')
+            extra = head.split() + ([tail.strip()] if tail.strip() else [])
     if status != 200 or body.get('tasks') or dashes or link is not None or len(words) < 2:
         return body.get('tasks') or [], ' '.join(extra), status, body
     found = None  # (count, tasks) of the longest leading run with a match
@@ -6900,18 +6921,7 @@ def handle(data, env, http=http_json):
     data = dict(data)
     if data.get('hook_event_name') == 'Stop':
         data.setdefault('_stop_deadline', time.monotonic() + STOP_CHECK_BUDGET)
-    output = _handle(data, env, http=http)
-    if data.get('hook_event_name') in ('UserPromptSubmit', 'Stop'):
-        # Deliver saved-task acknowledgments in this session, not only at the next SessionStart.
-        notice = take_install_note(env, data)
-        if notice:
-            output = dict(output or {})
-            text = notice['hookSpecificOutput']['additionalContext']
-            if data.get('hook_event_name') == 'UserPromptSubmit':
-                hook = output.setdefault('hookSpecificOutput', {'hookEventName': 'UserPromptSubmit'})
-                hook['additionalContext'] = (hook.get('additionalContext', '') + '\n\n' + text).strip()
-            output['systemMessage'] = (output.get('systemMessage', '') + '\n' + notice['systemMessage']).strip()
-    return output
+    return _handle(data, env, http=http)
 
 
 def _forget_result_message(env, data):
@@ -6985,8 +6995,6 @@ def _handle(data, env, http=http_json):
         if marker:
             marker.pop('awaiting_owner', None)
             save_marker(env, marker)
-        if _pending_saves(env) and not _save_poller_running(env):
-            SAVE_POLLER(env)
         heartbeat(data, env, http=http)
         sync_active_method(data, env, http=http)
         marker, config = _session_config(env, data)
@@ -7078,9 +7086,6 @@ if __name__ == '__main__':
     if len(sys.argv) > 1 and sys.argv[1] == 'refresh':
         refresh_installed_tasks(dict(os.environ))
         sys.exit(0)
-    if len(sys.argv) > 1 and sys.argv[1] == 'saves':
-        poll_saves_until_done(dict(os.environ))
-        sys.exit(0)
     if len(sys.argv) > 1 and sys.argv[1] == 'schedules':
         reconcile_schedules(dict(os.environ))
         sys.exit(0)
@@ -7088,5 +7093,5 @@ if __name__ == '__main__':
         sys.exit(run_main(sys.argv[2:]))
     if len(sys.argv) > 1 and sys.argv[1] == 'save':
         sys.exit(save_main(dict(os.environ)))
-    sys.stderr.write('usage: consolex.py hook|poll|refresh|saves|schedules|run|save  (hooks read the hook JSON on stdin; run <task words> starts an isolated run; save reads the consolex_save fields as JSON on stdin)\n')
+    sys.stderr.write('usage: consolex.py hook|poll|refresh|schedules|run|save (hooks read the hook JSON on stdin; run <task words> starts an isolated run; save reads the consolex_save fields as JSON on stdin)\n')
     sys.exit(2)

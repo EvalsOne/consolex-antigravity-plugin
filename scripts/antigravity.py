@@ -136,6 +136,25 @@ def translate(output, event, payload):
     return _injection(_context(output))
 
 
+def _question_response(text, is_error):
+    """Parse Antigravity's plain-text ask_question output (`A1: ...`) into runtime.py's structured answer shape."""
+    if is_error or not isinstance(text, str):
+        return text
+    answers = {}
+    current = None
+    for line in text.splitlines():
+        match = re.match(r'^(A\d+):\s*(.*)$', line)
+        if match:
+            current = match[1]
+            value = match[2].strip()
+            answers[current] = [value] if value else []
+        elif current is not None and not line.startswith(('Created At:', 'Completed At:')):
+            if line.strip():
+                answers[current].append(line.strip())
+    structured = {key: {'answers': ['\n'.join(lines)]} for key, lines in answers.items() if lines}
+    return {'answers': structured} if structured else text
+
+
 def _tool_events(rows, data, cursor, final=False):
     """Pair one native tool request with its adjacent GENERIC result.
 
@@ -160,10 +179,14 @@ def _tool_events(rows, data, cursor, final=False):
                               or following.get('media'))
             native = {'toolCall': call}
             name, args, _ = tool_call(native)
+            is_error = row.get('status') == 'ERROR' or following.get('status') == 'ERROR'
+            response = following.get('content') or '' if paired else ''
+            if name == 'ask_question' and paired:
+                response = _question_response(response, is_error)
             yield {**data, 'hook_event_name': 'PostToolUse', 'tool_name': name,
                    'tool_input': args, 'tool_use_id': 'agy-%s-%s' % (index, ordinal),
-                   'tool_response': following.get('content') or '' if paired else '',
-                   'is_error': row.get('status') == 'ERROR' or following.get('status') == 'ERROR',
+                   'tool_response': response,
+                   'is_error': is_error,
                    'source_incomplete': incomplete, '_step': index}
 
 

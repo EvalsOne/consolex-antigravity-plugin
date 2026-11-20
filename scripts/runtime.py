@@ -7,14 +7,18 @@ active task session’s rollout to place public model responses and tool request
 The package builder puts this module and consolex_core.py beside each other.
 """
 import contextlib
+import base64
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
 import re
+import socket
+import struct
 import sys
 import time
+from urllib.parse import quote
 
 _path = Path(__file__).with_name('consolex_core.py')
 _spec = importlib.util.spec_from_file_location('consolex_core', _path)
@@ -130,6 +134,148 @@ def _record_interruption(data, env, http):
         marker.pop('interrupt_sync_pending', None)
     core.save_marker(env, marker)
     return acknowledged
+
+
+def _codex_control(env, marker, http, *, acknowledge=False):
+    saved_api = marker.get('task_api_base')
+    if not saved_api:
+        return None, {}
+    data = {'session_id': marker['session_id']}
+    _, config = _end_session_config(data, env)
+    token = core._token(config, env) if config else None
+    if not token:
+        return None, {}
+    path = 'sessions/%s/runs/%s/control' % (quote(marker['session_id'], safe=''), marker['run_control']['run_id'])
+    return http('POST' if acknowledge else 'GET', core._task_url(config, env, path), token,
+                timeout=core.SESSION_TIMEOUT)
+
+
+def _stop_requested_from_consolex(data, env, marker, http):
+    control = (marker or {}).get('run_control') or {}
+    if not control.get('run_id') or data.get('turn_id') != control.get('turn_id'):
+        return False
+    if marker.get('remote_stop_run_id') == control['run_id']:
+        return True
+    status, body = _codex_control(env, marker, http)
+    if status != 200 or not body.get('cancel_requested'):
+        return False
+    marker['remote_stop_run_id'] = control['run_id']
+    core.save_marker(env, marker)
+    return True
+
+
+def _stop_at_hook(data, env, marker, http):
+    message = 'The owner stopped this ConsoleX run. End this turn now. Do not run more tools or submit a delivery.'
+    event = data['hook_event_name']
+    if event == 'PreToolUse':
+        return {'hookSpecificOutput': {'hookEventName': event, 'permissionDecision': 'deny',
+                                       'permissionDecisionReason': message}}
+    if event == 'PostToolUse':
+        return {'decision': 'block', 'reason': message}
+    # Codex has reached its final-response hook. Prevent other Stop hooks from
+    # continuing the turn and acknowledge only this run to ConsoleX.
+    status, body = _codex_control(env, marker, http, acknowledge=True)
+    if status == 200 and body.get('cancelled'):
+        if marker.get('checkpoint_required'):
+            marker.update(task_stopped=True, state='idle')
+            core.save_marker(env, marker)
+        else:
+            core.clear_marker(env, data['session_id'])
+    return {'continue': False, 'stopReason': message}
+
+
+def _codex_app_server_rpc(path, method, params):
+    """One request to the host's private Unix App Server socket (WebSocket JSON-RPC)."""
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.settimeout(2)
+        connection.connect(os.path.realpath(path))
+        key = base64.b64encode(os.urandom(16)).decode('ascii')
+        connection.sendall((
+            'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n'
+            'Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: %s\r\n\r\n' % key).encode('ascii'))
+        with connection.makefile('rb') as incoming:
+            status = incoming.readline(4096)
+            headers = {}
+            for _ in range(32):
+                line = incoming.readline(4096)
+                if line == b'\r\n':
+                    break
+                name, value = line.split(b':', 1)
+                headers[name.lower()] = value.strip()
+            accept = base64.b64encode(hashlib.sha1((key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest())
+            if status.split()[1:2] != [b'101'] or headers.get(b'sec-websocket-accept') != accept:
+                raise OSError('Codex App Server did not accept the connection')
+
+            def send(payload, opcode=1):
+                mask = os.urandom(4)
+                length = len(payload)
+                size = bytes([128 + length]) if length < 126 else b'\xfe' + struct.pack('!H', length)
+                encoded = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+                connection.sendall(bytes([128 + opcode]) + size + mask + encoded)
+
+            def request(name, arguments=None, request_id=None):
+                wire = {'method': name}
+                if arguments is not None:
+                    wire['params'] = arguments
+                if request_id is not None:
+                    wire['id'] = request_id
+                send(json.dumps(wire).encode())
+                if request_id is None:
+                    return None
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    flags, size = incoming.read(2)
+                    if size == 126:
+                        size, = struct.unpack('!H', incoming.read(2))
+                    elif size == 127:
+                        size, = struct.unpack('!Q', incoming.read(8))
+                    if size > 1_048_576 or not flags & 128:
+                        raise OSError('Unsupported Codex App Server frame')
+                    raw = incoming.read(size)
+                    opcode = flags & 15
+                    if opcode == 9:
+                        send(raw, opcode=10)
+                    if opcode == 8:
+                        break
+                    if opcode == 1:
+                        response = json.loads(raw)
+                        if response.get('id') == request_id:
+                            return response.get('result')
+                return None
+
+            if request('initialize', {'clientInfo': {'name': 'consolex', 'version': '1.9.11'}}, 1) is None:
+                return None
+            request('initialized')
+            return request(method, params, 2)
+
+
+def watch_codex_turn(env, session_id, run_id, turn_id, socket_path, http=core.http_json, rpc=_codex_app_server_rpc):
+    """Interrupt only the registered turn, on a host that exposes this live thread."""
+    try:
+        thread = rpc(socket_path, 'thread/read', {'threadId': session_id, 'includeTurns': False})
+        if ((thread or {}).get('thread') or {}).get('status', {}).get('type') != 'active':
+            return
+        binding = {'run_id': run_id, 'turn_id': turn_id}
+        interrupted = False
+        while True:
+            with session_lock(env, session_id):
+                marker = core.load_marker(env, session_id)
+            if not marker or marker.get('run_control') != binding:
+                return
+            status, body = _codex_control(env, marker, http)
+            if status in (401, 403, 404) or status == 200 and not body.get('running'):
+                return
+            if status == 200 and body.get('cancel_requested'):
+                if not interrupted:
+                    interrupted = rpc(socket_path, 'turn/interrupt', {'threadId': session_id, 'turnId': turn_id}) == {}
+                    if not interrupted:
+                        return  # The host refused this turn. Hooks can still stop it.
+                status, body = _codex_control(env, marker, http, acknowledge=True)
+                if status == 200 and body.get('cancelled'):
+                    return
+            time.sleep(4)
+    except (OSError, ValueError, struct.error):
+        return
 
 
 def _native_text(text, runtime):
@@ -592,7 +738,7 @@ def handle(data, env, runtime, http=core.http_json):
         else:
             return None
     if event == 'SessionStart':
-        core.on_session_start(data, env, spawn=SPAWN_REFRESH, note=False)
+        core.on_session_start(data, env, spawn=SPAWN_REFRESH)
         return None
     if event in ('SessionEnd', 'Interrupt'):
         core.SESSION_TIMEOUT = 2
@@ -600,6 +746,9 @@ def handle(data, env, runtime, http=core.http_json):
             data['tools'] = _delivery_records(marker, runtime)
             data['tool_notes'] = marker.get('tool_notes', {})
         if runtime == 'codex' and event == 'Interrupt' and marker:
+            control = marker.get('run_control') or {}
+            if data.get('turn_id') and control.get('turn_id') and data['turn_id'] != control['turn_id']:
+                return None
             if marker.get('stop_requested'):
                 if _finish_stopped_task(data, env, http) and core.load_marker(env, data.get('session_id')):
                     return {'systemMessage': 'The task stopped. Review or cancel any stage-check execution on Runs.'}
@@ -638,7 +787,13 @@ def handle(data, env, runtime, http=core.http_json):
                 core.refresh_recovery_preference(marker, config, env, http=http)
                 marker['owner_answered_at'] = time.time()
                 core.save_marker(env, marker)
-            if not (runtime == 'codex' and was_interrupted and marker.get('stop_requested')):
+            if (runtime == 'codex' and marker.get('run_control') and not synthetic
+                    and (was_interrupted or resuming_stopped) and CONTINUE_REQUEST.fullmatch(prompt)):
+                _, config = _end_session_config(data, env)
+                if config:
+                    core.session_event(config, env, data, marker, 'start', http=http)
+                    core.save_marker(env, marker)
+            elif not (runtime == 'codex' and was_interrupted and marker.get('stop_requested')):
                 if runtime == 'codex' and (was_interrupted or resuming_stopped):
                     # Older servers reopen an ended run when `seen` carries activity. Send an
                     # explicit empty snapshot too, so continuation needs no server upgrade.
@@ -656,7 +811,7 @@ def handle(data, env, runtime, http=core.http_json):
         journal_path = _journal_path(env, data.get('session_id'))
         if journal_path and not os.path.exists(journal_path):
             # A session's first prompt: its start, where a runtime has no SessionStart event (refresh is hourly at most).
-            core.on_session_start(data, env, spawn=SPAWN_REFRESH, note=False)
+            core.on_session_start(data, env, spawn=SPAWN_REFRESH)
         _journal_prompt(env, data, prompt, command=bool(match), synthetic=synthetic)
         if match:
             if match[1] == 'check' and marker:
@@ -700,20 +855,20 @@ def handle(data, env, runtime, http=core.http_json):
                 if not synthetic and not schedule_id and body:
                     core.note_user_message(env, data.get('session_id'), body)
                 return adapt(output, runtime)
-        # A task added here after the owner saved it in ConsoleX (/consolex:save): said with the next plain prompt,
-        # since these runtimes show nothing from a session start.
         guarded = core.checkpoint_hook(data, env, http=http)
         if guarded:
             if (runtime == 'codex' and marker and not synthetic and guarded.get('decision') != 'block'
                     and guarded.get('hookSpecificOutput')):
                 guarded = _with_stop_guidance(data, guarded)
             return adapt(guarded, runtime)
-        note = core.take_install_note(env, {**data, 'hook_event_name': 'UserPromptSubmit'})
         if runtime == 'codex' and marker and not synthetic:
-            note = _with_stop_guidance(data, note)
-        return adapt(note, runtime) if note else None
+            return adapt(_with_stop_guidance(data, None), runtime)
+        return None
     if runtime == 'codex' and marker and marker.get('host_interrupted'):
         return None  # A late tool/Stop callback from the interrupted turn is not new work.
+    if (runtime == 'codex' and event in ('PreToolUse', 'PostToolUse', 'Stop')
+            and _stop_requested_from_consolex(data, env, marker, http)):
+        return _stop_at_hook(data, env, marker, http)
     if event == 'PreToolUse':
         if runtime in ('codex', 'antigravity') and data.get('tool_name') == 'mcp__consolex__' + core.START_TASK_TOOL:
             return prepare_start_call(data, env)
@@ -724,7 +879,7 @@ def handle(data, env, runtime, http=core.http_json):
         if marker:
             if event == 'PreToolUse':
                 core.session_state(data, env, 'ask', http=http)
-            elif _answer(data.get('tool_response')):
+            elif not data.get('is_error') and _answer(data.get('tool_response')):
                 answer_text = core._extract_answer_text(data)
                 if answer_text:
                     core.note_user_message(env, data.get('session_id'), answer_text)
@@ -893,6 +1048,10 @@ def session_lock(env, session_id):
 def main():
     runtime = os.environ.get('CONSOLEX_RUNTIME', 'codex')
     env = environment(dict(os.environ), runtime)
+    if runtime == 'codex' and len(sys.argv) == 6 and sys.argv[1] == '--watch-codex-turn':
+        _, _, session_id, run_id, turn_id, path = sys.argv
+        watch_codex_turn(env, session_id, int(run_id), turn_id, path)
+        return
     try:
         data = json.load(sys.stdin)
         with session_lock(env, data.get('session_id')):
