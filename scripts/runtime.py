@@ -243,7 +243,7 @@ def _codex_app_server_rpc(path, method, params):
                             return response.get('result')
                 return None
 
-            if request('initialize', {'clientInfo': {'name': 'consolex', 'version': '1.9.11'}}, 1) is None:
+            if request('initialize', {'clientInfo': {'name': 'consolex', 'version': '1.9.12'}}, 1) is None:
                 return None
             request('initialized')
             return request(method, params, 2)
@@ -689,13 +689,22 @@ def task_tool_event(data, env, http=core.http_json):
     if data.get('hook_event_name') == 'ConsoleXTaskTools':
         text, is_error = core.task_tools_reply(env, data.get('task'), http=http, cwd=data.get('cwd'))
         return {'text': text, 'is_error': is_error}
+    if data.get('hook_event_name') == 'ConsoleXListProfiles':
+        text, is_error = core.profiles_reply(env, http=http)
+        return {'text': text, 'is_error': is_error}
+    if data.get('hook_event_name') == 'ConsoleXGetProfile':
+        text, is_error = core.profile_reply(env, data.get('profile'), data.get('kind'), data.get('include_samples'), http=http)
+        return {'text': text, 'is_error': is_error}
     return _native_task_tool(data, env, http)
+
+
+NATIVE_TOOL_EVENTS = ('ConsoleXTaskTools', 'ConsoleXRunTaskTool', 'ConsoleXRenameSkill', 'ConsoleXCommand', 'ConsoleXSave',
+                      'ConsoleXCheckpoint', 'ConsoleXListProfiles', 'ConsoleXGetProfile')
 
 
 def handle(data, env, runtime, http=core.http_json):
     env = environment(env, runtime)
-    if data.get('hook_event_name') in ('ConsoleXTaskTools', 'ConsoleXRunTaskTool', 'ConsoleXRenameSkill', 'ConsoleXCommand',
-                                       'ConsoleXSave', 'ConsoleXCheckpoint'):
+    if data.get('hook_event_name') in NATIVE_TOOL_EVENTS:
         return task_tool_event(data, env, http=http)
     data = dict(data)
     data['prompt_id'] = str(data.get('turn_id') or data.get('prompt_id') or 'turn')

@@ -54,7 +54,7 @@ Each trigger opens a new conversation for the saved ConsoleX task. The plugin ch
 
 The plugin reads the active conversation's local transcript through Antigravity hooks. For a delivery check it sends ConsoleX the declared reply or text files, model and session identifiers, confirmation items, and captured tool calls and results. It skips private model thinking and redacts credential patterns from tool evidence. Set `CONSOLEX_TOOL_EVIDENCE=off` to omit tool evidence. Saving a conversation as a task is an explicit command and creates a reviewable draft.
 
-Sign-in is shared with the other ConsoleX coding-agent plugins through `~/.consolex/credentials.json`. Antigravity session state is stored separately. Task-tool access remains subject to Antigravity's permissions and the task's ConsoleX settings.
+Sign-in is shared with the other ConsoleX coding-agent plugins through `~/.consolex/credentials.json`. Antigravity session state is stored separately. Task-tool access remains subject to Antigravity's permissions and the task's ConsoleX settings. `consolex_list_profiles` and `consolex_get_profile` read your ConsoleX client and product profiles (read-only: a profile is changed only in ConsoleX), so the agent can write in a client's voice or from a product's facts outside a task.
 
 ## License
 
