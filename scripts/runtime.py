@@ -243,7 +243,7 @@ def _codex_app_server_rpc(path, method, params):
                             return response.get('result')
                 return None
 
-            if request('initialize', {'clientInfo': {'name': 'consolex', 'version': '1.9.12'}}, 1) is None:
+            if request('initialize', {'clientInfo': {'name': 'consolex', 'version': '1.9.13'}}, 1) is None:
                 return None
             request('initialized')
             return request(method, params, 2)
@@ -751,6 +751,8 @@ def handle(data, env, runtime, http=core.http_json):
         return None
     if event in ('SessionEnd', 'Interrupt'):
         core.SESSION_TIMEOUT = 2
+        # A turn cut short never reaches Stop: the skill edits it noted are sent now.
+        core.flush_session_methods(data, env, http=http)
         if marker:
             data['tools'] = _delivery_records(marker, runtime)
             data['tool_notes'] = marker.get('tool_notes', {})
@@ -810,6 +812,8 @@ def handle(data, env, runtime, http=core.http_json):
                 core.heartbeat(data, env, http=http)
         # A Codex app scheduled run: the app puts the automation's name and id above the saved prompt.
         schedule_id, body = core.codex_automation(prompt)
+        # Skills changed outside a turn that syncs them (an editor, `git pull`, another agent), at most every 5 minutes.
+        core.check_methods_if_due(env, data.get('cwd') or os.getcwd(), http=http)
         if runtime == 'codex':
             # A Codex app scheduled run starts, or an automation changed since the last sync: ConsoleX hears this
             # computer's schedules (in the background).
@@ -906,7 +910,8 @@ def handle(data, env, runtime, http=core.http_json):
         return adapt(core.on_codex_schedule_changed(data, env, http=http), runtime)
     if event == 'PostToolUse':
         # A tool that names a skill folder may have edited it (a patch, a shell command): synced when the turn ends.
-        core.note_method_edit(env, data.get('session_id'), core.skill_paths_in(data.get('tool_input') or {}, data.get('cwd')))
+        core.note_method_edit(env, data.get('session_id'), core.skill_paths_in(data.get('tool_input') or {}, data.get('cwd')),
+                              data.get('cwd'))
         output = _activate_from_tool(data, env, http)
         marker = core.load_marker(env, data.get('session_id'))
         if marker and not _evidence_off(env):
